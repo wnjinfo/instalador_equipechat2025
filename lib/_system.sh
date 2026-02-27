@@ -3,7 +3,7 @@
 # system management
 
 #######################################
-# creates user - CORRIGIDO
+# creates user
 # Arguments:
 #   None
 #######################################
@@ -14,28 +14,9 @@ system_create_user() {
 
   sleep 2
 
-  # CORREÇÃO: Usar senha fixa para o usuário deploy
-  # A variável mysql_root_password não faz sentido aqui
-  local deploy_password="Senha123@deploy"
-  
   sudo su - root <<EOF
-  # Verifica se o usuário já existe
-  if id "deploy" &>/dev/null; then
-    echo "Usuário deploy já existe, atualizando senha..."
-    echo "deploy:${deploy_password}" | chpasswd
-  else
-    echo "Criando usuário deploy..."
-    useradd -m -p \$(openssl passwd -6 "${deploy_password}") -s /bin/bash deploy
-    usermod -aG sudo deploy
-    echo "Usuário deploy criado com sucesso"
-  fi
-  
-  # Garante que está no grupo sudo
+  useradd -m -p $(openssl passwd -crypt ${mysql_root_password}) -s /bin/bash -G sudo deploy
   usermod -aG sudo deploy
-  
-  # Verifica
-  id deploy
-  groups deploy
 EOF
 
   sleep 2
@@ -50,6 +31,7 @@ system_git_clone() {
   print_banner
   printf "${WHITE} 💻 Fazendo download do código Equipechat...${GRAY_LIGHT}"
   printf "\n\n"
+
 
   sleep 2
 
@@ -80,6 +62,8 @@ EOF
   sleep 2
 }
 
+
+
 #######################################
 # delete system
 # Arguments:
@@ -101,10 +85,10 @@ deletar_tudo() {
   
   sleep 2
 
-  # CORREÇÃO: Remoção correta do PostgreSQL via Docker
-  docker stop postgres-${empresa_delete} 2>/dev/null || true
-  docker rm postgres-${empresa_delete} 2>/dev/null || true
-  docker volume rm postgres-data-${empresa_delete} 2>/dev/null || true
+  sudo su - postgres
+  dropuser ${empresa_delete}
+  dropdb ${empresa_delete}
+  exit
 EOF
 
 sleep 2
@@ -121,7 +105,9 @@ EOF
   printf "${WHITE} 💻 Remoção da Instancia/Empresa ${empresa_delete} realizado com sucesso ...${GRAY_LIGHT}"
   printf "\n\n"
 
+
   sleep 2
+
 }
 
 #######################################
@@ -283,64 +269,42 @@ EOF
 }
 
 #######################################
-# installs node - CORRIGIDO (removido PostgreSQL daqui)
+# installs node e postgresql
 # Arguments:
 #   None
 #######################################
 system_node_install() {
   print_banner
-  printf "${WHITE} 💻 Instalando nodejs...${GRAY_LIGHT}"
+  printf "${WHITE} 💻 Instalando nodejs e PostgreSQL...${GRAY_LIGHT}"
   printf "\n\n"
 
   sleep 2
 
   sudo su - root <<EOF
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  # Node.js
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
-  sleep 2
   npm install -g npm@latest
-  sleep 2
-  sudo timedatectl set-timezone America/Sao_Paulo
+  
+  # ✅ PostgreSQL (corrigido)
+  apt install -y postgresql postgresql-contrib
+  systemctl start postgresql
+  systemctl enable postgresql
+  sleep 5
+  
+  # Configura senha do postgres
+  sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '${mysql_root_password}';"
+  
+  # Timezone
+  timedatectl set-timezone America/Sao_Paulo
+  
+  # Verificações
+  node --version
+  psql --version
 EOF
 
   sleep 2
 }
-
-#######################################
-# installs postgres via docker - NOVA FUNÇÃO
-# Arguments:
-#   None
-#######################################
-system_postgres_install() {
-  print_banner
-  printf "${WHITE} 💻 Instalando PostgreSQL via Docker...${GRAY_LIGHT}"
-  printf "\n\n"
-
-  sleep 2
-
-  sudo su - root <<EOF
-  # Cria diretório para dados do PostgreSQL
-  mkdir -p /docker/postgres
-  
-  # Baixa e executa container PostgreSQL
-  docker run --name postgres-${instancia_add} \
-    -e POSTGRES_PASSWORD=postgres \
-    -e POSTGRES_DB=${instancia_add} \
-    -e POSTGRES_USER=postgres \
-    -p 5432:5432 \
-    -v postgres-data-${instancia_add}:/var/lib/postgresql/data \
-    -d postgres:15-alpine
-  
-  # Aguarda PostgreSQL iniciar
-  sleep 10
-  
-  # Verifica se está rodando
-  docker ps | grep postgres-${instancia_add}
-EOF
-
-  sleep 2
-}
-
 #######################################
 # installs docker
 # Arguments:
@@ -360,17 +324,9 @@ system_docker_install() {
 
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
   
-  add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable"
+  add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
 
-  apt update
   apt install -y docker-ce
-  
-  # Adiciona usuário deploy ao grupo docker
-  usermod -aG docker deploy
-  
-  # Inicia docker
-  systemctl start docker
-  systemctl enable docker
 EOF
 
   sleep 2
@@ -457,8 +413,7 @@ system_pm2_install() {
 
   sudo su - root <<EOF
   npm install -g pm2
-  su - deploy -c "pm2 startup systemd"
-  su - deploy -c "pm2 save"
+
 EOF
 
   sleep 2
@@ -589,6 +544,7 @@ system_certbot_setup() {
           --agree-tos \
           --non-interactive \
           --domains $backend_domain,$frontend_domain
+
 EOF
 
   sleep 2
