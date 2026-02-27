@@ -6,13 +6,16 @@
 
 set -e  # Para o script em caso de erro
 
-# Cores para output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-WHITE='\033[1;37m'
-GRAY_LIGHT='\033[0;37m'
-NC='\033[0m' # No Color
+# Verifica se as variáveis de cor já existem
+if [[ -z "${RED}" ]]; then
+  # Cores para output
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  WHITE='\033[1;37m'
+  GRAY_LIGHT='\033[0;37m'
+  NC='\033[0m' # No Color
+fi
 
 # Configurações padrão
 DEPLOY_USER="deploy"
@@ -46,29 +49,40 @@ log_info() {
   printf "${YELLOW} ℹ️  $1${NC}\n"
 }
 
+# Função para log de aviso
+log_warning() {
+  printf "${YELLOW} ⚠️  $1${NC}\n"
+}
+
 # Função para validar variáveis obrigatórias
 validate_variables() {
   local missing_vars=()
   
-  # Lista de variáveis obrigatórias
-  local required_vars=(
-    "link_git"
-    "instancia_add"
-    "backend_port"
-    "frontend_port"
-    "backend_url"
-    "frontend_url"
-    "deploy_email"
-  )
-  
-  for var in "${required_vars[@]}"; do
-    if [ -z "${!var}" ]; then
-      missing_vars+=("$var")
-    fi
-  done
+  # Lista de variáveis obrigatórias para deploy
+  if [[ "$1" == "deploy" ]]; then
+    local required_vars=(
+      "link_git"
+      "instancia_add"
+      "backend_port"
+      "frontend_port"
+      "backend_url"
+      "frontend_url"
+      "deploy_email"
+    )
+    
+    for var in "${required_vars[@]}"; do
+      if [ -z "${!var}" ]; then
+        missing_vars+=("$var")
+      fi
+    done
+  fi
   
   if [ ${#missing_vars[@]} -ne 0 ]; then
     log_error "Variáveis obrigatórias não definidas: ${missing_vars[*]}"
+    log_info "Defina as variáveis antes de executar:"
+    for var in "${missing_vars[@]}"; do
+      echo "  export $var=\"valor\""
+    done
     exit 1
   fi
 }
@@ -84,7 +98,8 @@ system_create_user() {
   # Gera senha aleatória se não for fornecida
   if [ -z "${DEPLOY_PASSWORD}" ]; then
     DEPLOY_PASSWORD=$(openssl rand -base64 12)
-    log_info "Senha gerada para usuário ${DEPLOY_USER}: ${DEPLOY_PASSWORD}"
+    log_warning "Senha gerada para usuário ${DEPLOY_USER}: ${DEPLOY_PASSWORD}"
+    log_warning "Salve esta senha em local seguro!"
   fi
   
   # Executa comandos como root
@@ -135,6 +150,12 @@ system_git_clone() {
     exit 1
   fi
 
+  # Verifica se o diretório home do usuário existe
+  if [ ! -d "/home/${DEPLOY_USER}" ]; then
+    log_error "Diretório do usuário ${DEPLOY_USER} não encontrado"
+    exit 1
+  fi
+
   # Executa como usuário deploy
   sudo su - ${DEPLOY_USER} <<EOF
   # Cria diretório se não existir
@@ -152,6 +173,10 @@ system_git_clone() {
   
   # Ajusta permissões
   chmod -R 755 /home/${DEPLOY_USER}/${instancia_add}
+  
+  # Lista conteúdo
+  echo "Conteúdo do diretório:"
+  ls -la /home/${DEPLOY_USER}/${instancia_add}/
 EOF
 
   if [ $? -eq 0 ]; then
@@ -190,7 +215,12 @@ system_update() {
     apt-transport-https \
     ca-certificates \
     gnupg \
-    lsb-release
+    lsb-release \
+    build-essential \
+    dirmngr
+    
+  # Limpa cache
+  apt clean
 EOF
 
   log_success "Sistema atualizado"
@@ -220,6 +250,12 @@ system_node_install() {
   # Verifica instalação
   node --version
   npm --version
+  
+  # Configura npm global sem sudo
+  mkdir -p /home/${DEPLOY_USER}/.npm-global
+  npm config set prefix '/home/${DEPLOY_USER}/.npm-global'
+  echo 'export PATH=/home/${DEPLOY_USER}/.npm-global/bin:$PATH' >> /home/${DEPLOY_USER}/.bashrc
+  chown -R ${DEPLOY_USER}:${DEPLOY_USER} /home/${DEPLOY_USER}/.npm-global
 EOF
 
   if [ $? -eq 0 ]; then
@@ -248,6 +284,9 @@ system_postgres_install() {
   systemctl start postgresql
   systemctl enable postgresql
   
+  # Aguarda PostgreSQL iniciar
+  sleep 5
+  
   # Configura PostgreSQL
   sudo -u postgres psql <<PSQL
     ALTER USER postgres WITH PASSWORD '${POSTGRES_PASSWORD}';
@@ -256,13 +295,17 @@ system_postgres_install() {
     \l
 PSQL
 
-  # Configura PostgreSQL para aceitar conexões
+  # Configura PostgreSQL para aceitar conexões locais
   echo "host all all 127.0.0.1/32 md5" >> /etc/postgresql/*/main/pg_hba.conf
   systemctl restart postgresql
+  
+  # Verifica status
+  systemctl status postgresql --no-pager
 EOF
 
   if [ $? -eq 0 ]; then
     log_success "PostgreSQL instalado com sucesso"
+    log_info "Banco de dados '${instancia_add}' criado"
   else
     log_error "Falha ao instalar PostgreSQL"
     exit 1
@@ -283,9 +326,12 @@ system_docker_install() {
   # Remove versões antigas
   apt remove -y docker docker-engine docker.io containerd runc || true
   
-  # Instala Docker
+  # Instala Docker usando script oficial
   curl -fsSL https://get.docker.com -o get-docker.sh
   sh get-docker.sh
+  
+  # Aguarda instalação
+  sleep 3
   
   # Adiciona usuário ao grupo docker
   usermod -aG docker ${DEPLOY_USER}
@@ -297,10 +343,15 @@ system_docker_install() {
   # Verifica instalação
   docker --version
   docker-compose --version
+  
+  # Inicia docker
+  systemctl start docker
+  systemctl enable docker
 EOF
 
   if [ $? -eq 0 ]; then
     log_success "Docker instalado com sucesso"
+    log_warning "Faça logout e login novamente para usar docker sem sudo"
   else
     log_error "Falha ao instalar Docker"
     exit 1
@@ -321,10 +372,13 @@ system_pm2_install() {
   npm install -g pm2
   
   # Configura PM2 para iniciar com boot
-  pm2 startup systemd -u ${DEPLOY_USER} --hp /home/${DEPLOY_USER}
+  su - ${DEPLOY_USER} -c "pm2 startup systemd -u ${DEPLOY_USER} --hp /home/${DEPLOY_USER}"
   
   # Configura permissões
   su - ${DEPLOY_USER} -c "pm2 save"
+  
+  # Verifica instalação
+  pm2 --version
 EOF
 
   if [ $? -eq 0 ]; then
@@ -391,7 +445,8 @@ system_puppeteer_dependencies() {
     lsb-release \
     xdg-utils \
     libgbm1 \
-    libxkbcommon0
+    libxkbcommon0 \
+    --no-install-recommends
 EOF
 
   log_success "Dependências do Puppeteer instaladas"
@@ -421,6 +476,9 @@ system_nginx_install() {
   # Reinicia serviço
   systemctl restart nginx
   systemctl enable nginx
+  
+  # Verifica status
+  systemctl status nginx --no-pager
 EOF
 
   if [ $? -eq 0 ]; then
@@ -442,13 +500,23 @@ system_certbot_install() {
   sleep 2
 
   sudo su - root <<EOF
+  # Remove versões antigas
   apt remove -y certbot || true
   
+  # Instala snap se necessário
+  apt install -y snapd
+  
+  # Atualiza snap
   snap install core
   snap refresh core
+  
+  # Instala certbot
   snap install --classic certbot
+  
+  # Cria link simbólico
   ln -sf /snap/bin/certbot /usr/bin/certbot
   
+  # Verifica instalação
   certbot --version
 EOF
 
@@ -478,7 +546,8 @@ system_certbot_setup() {
           --non-interactive \
           --agree-tos \
           --email ${deploy_email} \
-          --domains ${backend_domain},${frontend_domain}
+          --domains ${backend_domain},${frontend_domain} \
+          || echo "Certbot pode ter falhado - verifique se os domínios apontam para este servidor"
   
   systemctl reload nginx
 EOF
@@ -486,8 +555,7 @@ EOF
   if [ $? -eq 0 ]; then
     log_success "Certificado SSL configurado com sucesso"
   else
-    log_error "Falha ao configurar certificado SSL"
-    exit 1
+    log_warning "Falha ao configurar certificado SSL - verifique se os domínios estão apontando para este servidor"
   fi
   
   sleep 2
@@ -515,6 +583,7 @@ EOF
 #######################################
 install_all() {
   log_info "Iniciando instalação completa..."
+  local start_time=$(date +%s)
   
   system_update
   system_create_user
@@ -529,9 +598,14 @@ install_all() {
   system_git_clone
   system_certbot_setup
   
-  log_success "Instalação completa finalizada com sucesso!"
-  log_info "Senha do usuário deploy: ${DEPLOY_PASSWORD}"
-  log_info "Arquivo com senha salvo em: /root/deploy_password.txt"
+  local end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+  
+  log_success "Instalação completa finalizada com sucesso em ${duration} segundos!"
+  
+  if [ -f "/root/deploy_password.txt" ]; then
+    log_warning "Senha do usuário deploy salva em: /root/deploy_password.txt"
+  fi
 }
 
 #######################################
@@ -541,7 +615,7 @@ deploy() {
   print_banner
   log_info "Iniciando processo de deploy..."
   
-  validate_variables
+  validate_variables "deploy"
   install_all
   
   print_banner
@@ -551,9 +625,12 @@ deploy() {
   echo "╠════════════════════════════════════════════════════════════╣"
   echo "║ Frontend: ${frontend_url}           ║"
   echo "║ Backend: ${backend_url}           ║"
-  echo "║ Usuário: ${DEPLOY_USER}           ║"
+  echo "║ Usuário: ${DEPLOY_USER}                                    ║"
+  echo "║ Banco: ${instancia_add}                                    ║"
   echo "╚════════════════════════════════════════════════════════════╝"
   printf "${NC}\n"
+  
+  log_warning "IMPORTANTE: Faça logout e login novamente para usar docker sem sudo"
 }
 
 #######################################
@@ -568,12 +645,14 @@ deletar_tudo() {
 
   if [ -z "${empresa_delete}" ]; then
     log_error "Nome da empresa não fornecido"
+    echo "Use: export empresa_delete=\"nome_da_empresa\""
     exit 1
   fi
 
   sudo su - root <<EOF
-  # Remove containers Docker
-  docker rm -f redis-${empresa_delete} 2>/dev/null || true
+  # Para containers Docker
+  docker stop redis-${empresa_delete} 2>/dev/null || true
+  docker rm redis-${empresa_delete} 2>/dev/null || true
   
   # Remove configurações do Nginx
   rm -f /etc/nginx/sites-enabled/${empresa_delete}-frontend
@@ -581,7 +660,7 @@ deletar_tudo() {
   rm -f /etc/nginx/sites-available/${empresa_delete}-frontend
   rm -f /etc/nginx/sites-available/${empresa_delete}-backend
   
-  # Remove banco de dados
+  # Remove banco de dados PostgreSQL
   sudo -u postgres psql -c "DROP DATABASE IF EXISTS ${empresa_delete};"
   sudo -u postgres psql -c "DROP USER IF EXISTS ${empresa_delete};"
   
@@ -589,12 +668,14 @@ deletar_tudo() {
   systemctl reload nginx
 EOF
 
-  # Remove arquivos do deploy
-  sudo su - ${DEPLOY_USER} <<EOF
-  rm -rf /home/${DEPLOY_USER}/${empresa_delete}
-  pm2 delete ${empresa_delete}-frontend ${empresa_delete}-backend 2>/dev/null || true
-  pm2 save
+  # Remove arquivos do deploy e processos PM2
+  if id "${DEPLOY_USER}" &>/dev/null; then
+    sudo su - ${DEPLOY_USER} <<EOF
+    pm2 delete ${empresa_delete}-frontend ${empresa_delete}-backend 2>/dev/null || true
+    pm2 save
 EOF
+    sudo rm -rf /home/${DEPLOY_USER}/${empresa_delete}
+  fi
 
   log_success "Remoção da instância ${empresa_delete} realizada com sucesso"
   sleep 2
@@ -608,15 +689,21 @@ configurar_bloqueio() {
 
   if [ -z "${empresa_bloquear}" ]; then
     log_error "Nome da empresa não fornecido"
+    echo "Use: export empresa_bloquear=\"nome_da_empresa\""
     exit 1
   fi
 
-  sudo su - ${DEPLOY_USER} <<EOF
-  pm2 stop ${empresa_bloquear}-backend || true
-  pm2 save
+  if id "${DEPLOY_USER}" &>/dev/null; then
+    sudo su - ${DEPLOY_USER} <<EOF
+    pm2 stop ${empresa_bloquear}-backend || true
+    pm2 save
 EOF
-
-  log_success "Bloqueio da instância ${empresa_bloquear} realizado com sucesso"
+    log_success "Bloqueio da instância ${empresa_bloquear} realizado com sucesso"
+  else
+    log_error "Usuário ${DEPLOY_USER} não encontrado"
+    exit 1
+  fi
+  
   sleep 2
 }
 
@@ -628,15 +715,21 @@ configurar_desbloqueio() {
 
   if [ -z "${empresa_desbloquear}" ]; then
     log_error "Nome da empresa não fornecido"
+    echo "Use: export empresa_desbloquear=\"nome_da_empresa\""
     exit 1
   fi
 
-  sudo su - ${DEPLOY_USER} <<EOF
-  pm2 start ${empresa_desbloquear}-backend || true
-  pm2 save
+  if id "${DEPLOY_USER}" &>/dev/null; then
+    sudo su - ${DEPLOY_USER} <<EOF
+    pm2 start ${empresa_desbloquear}-backend || true
+    pm2 save
 EOF
-
-  log_success "Desbloqueio da instância ${empresa_desbloquear} realizado com sucesso"
+    log_success "Desbloqueio da instância ${empresa_desbloquear} realizado com sucesso"
+  else
+    log_error "Usuário ${DEPLOY_USER} não encontrado"
+    exit 1
+  fi
+  
   sleep 2
 }
 
@@ -646,8 +739,14 @@ configurar_dominio() {
   log_info "Alterando domínios da instância ${empresa_dominio}..."
   sleep 2
 
-  if [ -z "${empresa_dominio}" ] || [ -z "${alter_backend_url}" ] || [ -z "${alter_frontend_url}" ]; then
+    if [ -z "${empresa_dominio}" ] || [ -z "${alter_backend_url}" ] || [ -z "${alter_frontend_url}" ] || [ -z "${alter_backend_port}" ] || [ -z "${alter_frontend_port}" ]; then
     log_error "Parâmetros não fornecidos corretamente"
+    echo "Necessário definir:"
+    echo "  export empresa_dominio=\"nome\""
+    echo "  export alter_backend_url=\"api.exemplo.com\""
+    echo "  export alter_frontend_url=\"app.exemplo.com\""
+    echo "  export alter_backend_port=\"3000\""
+    echo "  export alter_frontend_port=\"3001\""
     exit 1
   fi
 
@@ -659,22 +758,26 @@ configurar_dominio() {
   rm -f /etc/nginx/sites-available/${empresa_dominio}-backend
 EOF
 
-  # Atualiza arquivos .env
-  sudo su - ${DEPLOY_USER} <<EOF
-  # Atualiza frontend .env
-  if [ -f "/home/${DEPLOY_USER}/${empresa_dominio}/frontend/.env" ]; then
-    sed -i "s|^REACT_APP_BACKEND_URL=.*|REACT_APP_BACKEND_URL=https://${alter_backend_url}|" /home/${DEPLOY_USER}/${empresa_dominio}/frontend/.env
-  fi
-  
-  # Atualiza backend .env
-  if [ -f "/home/${DEPLOY_USER}/${empresa_dominio}/backend/.env" ]; then
-    sed -i "s|^BACKEND_URL=.*|BACKEND_URL=https://${alter_backend_url}|" /home/${DEPLOY_USER}/${empresa_dominio}/backend/.env
-    sed -i "s|^FRONTEND_URL=.*|FRONTEND_URL=https://${alter_frontend_url}|" /home/${DEPLOY_USER}/${empresa_dominio}/backend/.env
-  fi
+  # Atualiza arquivos .env se existirem
+  if id "${DEPLOY_USER}" &>/dev/null; then
+    sudo su - ${DEPLOY_USER} <<EOF
+    # Atualiza frontend .env
+    if [ -f "/home/${DEPLOY_USER}/${empresa_dominio}/frontend/.env" ]; then
+      sed -i "s|^REACT_APP_BACKEND_URL=.*|REACT_APP_BACKEND_URL=https://${alter_backend_url}|" /home/${DEPLOY_USER}/${empresa_dominio}/frontend/.env
+      echo "Frontend .env atualizado"
+    fi
+    
+    # Atualiza backend .env
+    if [ -f "/home/${DEPLOY_USER}/${empresa_dominio}/backend/.env" ]; then
+      sed -i "s|^BACKEND_URL=.*|BACKEND_URL=https://${alter_backend_url}|" /home/${DEPLOY_USER}/${empresa_dominio}/backend/.env
+      sed -i "s|^FRONTEND_URL=.*|FRONTEND_URL=https://${alter_frontend_url}|" /home/${DEPLOY_USER}/${empresa_dominio}/backend/.env
+      echo "Backend .env atualizado"
+    fi
 EOF
+  fi
 
   # Configura novo backend no Nginx
-  backend_hostname=$(echo "${alter_backend_url}" | sed 's|https://||')
+  backend_hostname=$(echo "${alter_backend_url}" | sed 's|https://||' | sed 's|http://||')
   sudo su - root <<EOF
   cat > /etc/nginx/sites-available/${empresa_dominio}-backend << 'END'
 server {
@@ -696,7 +799,7 @@ END
 EOF
 
   # Configura novo frontend no Nginx
-  frontend_hostname=$(echo "${alter_frontend_url}" | sed 's|https://||')
+  frontend_hostname=$(echo "${alter_frontend_url}" | sed 's|https://||' | sed 's|http://||')
   sudo su - root <<EOF
   cat > /etc/nginx/sites-available/${empresa_dominio}-frontend << 'END'
 server {
@@ -720,14 +823,16 @@ END
   nginx -t && systemctl reload nginx
 EOF
 
-  # Renova certificado SSL
+  # Renova certificado SSL se email foi fornecido
   if [ -n "${deploy_email}" ]; then
+    log_info "Renovando certificado SSL..."
     sudo su - root <<EOF
     certbot --nginx \
             --non-interactive \
             --agree-tos \
             --email ${deploy_email} \
-            --domains ${backend_hostname},${frontend_hostname}
+            --domains ${backend_hostname},${frontend_hostname} \
+            || echo "Certbot pode ter falhado - verifique os domínios"
 EOF
   fi
 
@@ -746,18 +851,23 @@ show_help() {
   echo "  deletar             - Remove uma instância (requer empresa_delete)"
   echo "  bloquear            - Bloqueia uma instância (requer empresa_bloquear)"
   echo "  desbloquear         - Desbloqueia uma instância (requer empresa_desbloquear)"
-  echo "  alterar-dominio     - Altera domínios (requer empresa_dominio, alter_backend_url, alter_frontend_url)"
+  echo "  alterar-dominio     - Altera domínios (requer múltiplas variáveis)"
+  echo "  help                - Mostra esta ajuda"
   echo ""
-  echo "Variáveis necessárias:"
+  echo "Variáveis necessárias para deploy:"
   echo "  link_git            - URL do repositório git"
   echo "  instancia_add       - Nome da instância"
-  echo "  backend_url         - URL do backend"
-  echo "  frontend_url        - URL do frontend"
+  echo "  backend_url         - URL do backend (ex: https://api.exemplo.com)"
+  echo "  frontend_url        - URL do frontend (ex: https://app.exemplo.com)"
   echo "  backend_port        - Porta do backend"
   echo "  frontend_port       - Porta do frontend"
   echo "  deploy_email        - Email para certificado SSL"
   echo ""
-  echo "Exemplo:"
+  echo "Variáveis opcionais:"
+  echo "  DEPLOY_PASSWORD     - Senha para usuário deploy (gerada automática se vazia)"
+  echo "  POSTGRES_PASSWORD   - Senha do PostgreSQL (padrão: postgres)"
+  echo ""
+  echo "Exemplo completo:"
   echo "  export link_git=\"https://github.com/usuario/repo.git\""
   echo "  export instancia_add=\"meuapp\""
   echo "  export backend_url=\"https://api.meuapp.com\""
@@ -769,9 +879,32 @@ show_help() {
 }
 
 #######################################
+# Verifica dependências básicas
+#######################################
+check_dependencies() {
+  local missing_deps=()
+  
+  for cmd in sudo openssl curl wget git; do
+    if ! command -v $cmd &> /dev/null; then
+      missing_deps+=($cmd)
+    fi
+  done
+  
+  if [ ${#missing_deps[@]} -ne 0 ]; then
+    log_error "Dependências básicas não encontradas: ${missing_deps[*]}"
+    log_info "Instale as dependências com:"
+    echo "  sudo apt update && sudo apt install -y ${missing_deps[*]}"
+    exit 1
+  fi
+}
+
+#######################################
 # Main
 #######################################
 main() {
+  # Verifica dependências básicas
+  check_dependencies
+  
   case "$1" in
     deploy)
       deploy
@@ -808,6 +941,7 @@ main() {
 # Verifica se está rodando como root
 if [ "$EUID" -eq 0 ]; then 
   log_error "Não execute este script como root diretamente"
+  echo "Use um usuário comum com sudo"
   exit 1
 fi
 
